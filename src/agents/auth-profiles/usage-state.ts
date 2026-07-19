@@ -5,6 +5,12 @@
  */
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { asDateTimestampMs } from "../../shared/number-coercion.js";
+import {
+  GEMINI_QUOTA_TIER_DAILY_LIMITS,
+  isGeminiQuotaTier,
+  isGoogleGeminiCliProvider,
+  utcDateKey,
+} from "./gemini-quota-tiers.js";
 import type { AuthProfileFailureReason, AuthProfileStore, ProfileUsageStats } from "./types.js";
 
 /** Returns true for providers whose auth-profile cooldowns are provider-managed. */
@@ -38,6 +44,62 @@ export function resolveProfileUnusableUntil(
 export function isActiveUnusableWindow(until: number | undefined, now: number): boolean {
   const timestamp = asDateTimestampMs(until);
   return timestamp !== undefined && timestamp > 0 && now < timestamp;
+}
+
+/**
+ * Returns true when `forModel` names a Gemini quota tier ("pro" | "flash")
+ * and the given profile has already reached that tier's known daily request
+ * ceiling for the current UTC date. This lets profile selection skip a
+ * profile that our own counting knows is exhausted, without waiting for an
+ * actual 429 from Google.
+ */
+function isProfileOverDailyGeminiQuota(params: {
+  store: AuthProfileStore;
+  profileId: string;
+  stats: ProfileUsageStats;
+  forModel: string | undefined;
+  now: number;
+}): boolean {
+  const { store, profileId, stats, forModel, now } = params;
+  if (!forModel || !isGeminiQuotaTier(forModel)) {
+    return false;
+  }
+  if (!isGoogleGeminiCliProvider(store.profiles[profileId]?.provider)) {
+    return false;
+  }
+  const todayCount = stats.dailyRequestCounts?.[utcDateKey(now)]?.[forModel] ?? 0;
+  return todayCount >= GEMINI_QUOTA_TIER_DAILY_LIMITS[forModel];
+}
+
+/**
+ * Returns true when a tier-scoped cooldown (set after a classified Gemini
+ * daily-quota-exhaustion failure) is currently active for `forModel`
+ * (expected to be a tier name for gemini-cli profiles). Independent of the
+ * profile-wide cooldown fields so a pro-tier cooldown never blocks flash.
+ */
+function isTierCooldownActive(
+  stats: Pick<ProfileUsageStats, "tierCooldowns">,
+  forModel: string | undefined,
+  now: number,
+): boolean {
+  if (!forModel) {
+    return false;
+  }
+  const until = stats.tierCooldowns?.[forModel];
+  return typeof until === "number" && Number.isFinite(until) && until > now;
+}
+
+/** Resolves the active tier-scoped cooldown-until timestamp, or null. */
+export function resolveTierCooldownUntil(
+  stats: Pick<ProfileUsageStats, "tierCooldowns"> | undefined,
+  tier: string | undefined,
+  now: number,
+): number | null {
+  if (!tier) {
+    return null;
+  }
+  const until = stats?.tierCooldowns?.[tier];
+  return typeof until === "number" && Number.isFinite(until) && until > now ? until : null;
 }
 
 function shouldBypassModelScopedCooldown(
@@ -75,6 +137,18 @@ export function isProfileInCooldown(
     return false;
   }
   const ts = now ?? Date.now();
+  // Gemini per-tier daily quota: treat a profile that our own counting knows
+  // has hit today's cap for the requested tier as unavailable for that tier,
+  // independent of (and in addition to) the generic cooldown fields below.
+  if (isProfileOverDailyGeminiQuota({ store, profileId, stats, forModel, now: ts })) {
+    return true;
+  }
+  // Tier-scoped cooldown set after a classified daily-quota-exhaustion
+  // failure (see markAuthProfileGeminiQuotaExhausted). Independent of the
+  // profile-wide cooldown fields so a pro-tier cooldown never blocks flash.
+  if (isTierCooldownActive(stats, forModel, ts)) {
+    return true;
+  }
   // Model-aware bypass: if the cooldown was caused by a model-scoped reason on a
   // specific model and the caller is requesting a *different* model, allow it.
   // We still honour profile-wide blocked/disabled windows; they must not be
@@ -201,6 +275,38 @@ export function clearExpiredCooldowns(store: AuthProfileStore, now?: number): bo
       stats.disabledUntil = undefined;
       stats.disabledReason = undefined;
       profileMutated = true;
+    }
+
+    if (stats.tierCooldowns) {
+      const nextTierCooldowns: Record<string, number> = {};
+      let tierCooldownsMutated = false;
+      for (const [tier, until] of Object.entries(stats.tierCooldowns)) {
+        if (typeof until === "number" && Number.isFinite(until) && until > ts) {
+          nextTierCooldowns[tier] = until;
+        } else {
+          tierCooldownsMutated = true;
+        }
+      }
+      if (tierCooldownsMutated) {
+        stats.tierCooldowns =
+          Object.keys(nextTierCooldowns).length > 0 ? nextTierCooldowns : undefined;
+        profileMutated = true;
+      }
+    }
+
+    if (stats.dailyRequestCounts) {
+      // Keep only today and yesterday (UTC) so counters cannot grow
+      // unboundedly; anything older is stale for same-day quota checks.
+      const keepKeys = new Set([utcDateKey(ts), utcDateKey(ts - 24 * 60 * 60 * 1000)]);
+      const staleKeys = Object.keys(stats.dailyRequestCounts).filter((key) => !keepKeys.has(key));
+      if (staleKeys.length > 0) {
+        const pruned = { ...stats.dailyRequestCounts };
+        for (const key of staleKeys) {
+          delete pruned[key];
+        }
+        stats.dailyRequestCounts = Object.keys(pruned).length > 0 ? pruned : undefined;
+        profileMutated = true;
+      }
     }
 
     // Reset error counters when ALL cooldowns have expired so the profile gets

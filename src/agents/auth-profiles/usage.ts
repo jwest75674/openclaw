@@ -16,6 +16,7 @@ import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { readProviderJsonResponse } from "../provider-http-errors.js";
 import { resolveProviderRequestHeaders } from "../provider-request-config.js";
 import { notifyAuthProfileFailureHook, setAuthProfileFailureHook } from "./failure-hook.js";
+import { utcDateKey } from "./gemini-quota-tiers.js";
 import { logAuthProfileFailureStateChange } from "./state-observation.js";
 
 const authProfileUsageLog = createSubsystemLogger("agent/embedded");
@@ -38,6 +39,7 @@ export {
   getSoonestCooldownExpiry,
   isProfileInCooldown,
   resolveProfileUnusableUntil,
+  resolveTierCooldownUntil,
 } from "./usage-state.js";
 
 const authProfileUsageDeps = {
@@ -589,6 +591,7 @@ function resetUsageStats(
     disabledUntil: undefined,
     disabledReason: undefined,
     failureCounts: undefined,
+    tierCooldowns: undefined,
     ...overrides,
   };
 }
@@ -972,4 +975,147 @@ export async function clearAuthProfileCooldown(params: {
     logDroppedAuthProfileBookkeeping("clear_cooldown", profileId);
   }
 }
+/**
+ * Marks a Gemini CLI auth profile as having exhausted a specific daily quota
+ * tier (pro or flash). Unlike `markAuthProfileFailure`'s generic
+ * `cooldownUntil`/`cooldownModel`/`cooldownReason` fields -- which can widen
+ * to profile-wide scope when a *different* model fails during an active
+ * cooldown window (see `computeNextProfileUsageStats`) -- this writes to the
+ * independent `tierCooldowns` map so a pro-tier exhaustion can never widen to
+ * also block flash-tier requests (or vice versa) on the same profile.
+ *
+ * `cooldownUntil` is expected to be the next UTC midnight (when Google resets
+ * the daily counter), not a stepped backoff.
+ */
+export async function markAuthProfileGeminiQuotaExhausted(params: {
+  store: AuthProfileStore;
+  profileId: string;
+  tier: "pro" | "flash";
+  cooldownUntil: number;
+  agentDir?: string;
+  runId?: string;
+}): Promise<void> {
+  const { store, profileId, tier, cooldownUntil, agentDir, runId } = params;
+  const profile = store.profiles[profileId];
+  if (!profile || isAuthCooldownBypassedForProvider(profile.provider)) {
+    return;
+  }
+  if (!isFutureDateTimestampMs(cooldownUntil)) {
+    return;
+  }
+
+  let nextStats: ProfileUsageStats | undefined;
+  let previousStats: ProfileUsageStats | undefined;
+  const updated = await authProfileUsageDeps.updateAuthProfileStoreWithLock({
+    agentDir,
+    updater: (freshStore) => {
+      const profileLocal = freshStore.profiles[profileId];
+      if (!profileLocal || isAuthCooldownBypassedForProvider(profileLocal.provider)) {
+        return false;
+      }
+      const now = Date.now();
+      previousStats = freshStore.usageStats?.[profileId];
+      const existingTierCooldowns = previousStats?.tierCooldowns ?? {};
+      const existingActiveUntil = existingTierCooldowns[tier];
+      const nextUntil =
+        typeof existingActiveUntil === "number" && existingActiveUntil > cooldownUntil
+          ? existingActiveUntil
+          : cooldownUntil;
+      nextStats = {
+        ...previousStats,
+        tierCooldowns: { ...existingTierCooldowns, [tier]: nextUntil },
+        lastFailureAt: now,
+      };
+      updateUsageStatsEntry(freshStore, profileId, () => nextStats as ProfileUsageStats);
+      return true;
+    },
+  });
+  if (updated) {
+    store.usageStats = updated.usageStats;
+    if (nextStats) {
+      // Tier-scoped cooldowns are a Gemini-specific concept with no
+      // equivalent in the shared AuthProfileFailureReason/FailoverReason
+      // unions consumed elsewhere (auth-controller.ts, model-fallback.ts),
+      // so this logs independently rather than through
+      // logAuthProfileFailureStateChange.
+      authProfileUsageLog.info("auth profile gemini quota tier exhausted", {
+        event: "auth_profile_gemini_quota_exhausted",
+        tags: ["auth_profiles", "gemini_quota"],
+        runId,
+        profileId,
+        provider: profile.provider,
+        tier,
+        cooldownUntil: nextStats.tierCooldowns?.[tier],
+      });
+    }
+    try {
+      notifyAuthProfileFailureHook();
+    } catch (err) {
+      authProfileUsageLog.warn("auth profile failure hook threw", {
+        event: "auth_profile_failure_hook_error",
+        tags: ["error_handling", "auth_profiles"],
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return;
+  }
+  if (updated === null) {
+    logDroppedAuthProfileBookkeeping("gemini_quota_exhausted", profileId);
+  }
+}
+
+/**
+ * Increments today's (UTC) per-tier request counter for a Gemini CLI auth
+ * profile after a successful call, and prunes stale dates so the counter map
+ * cannot grow unboundedly. No-op for non-Gemini-CLI profiles or models with
+ * no recognized daily-quota tier (e.g. flash-lite).
+ */
+export async function recordAuthProfileGeminiDailyRequest(params: {
+  store: AuthProfileStore;
+  profileId: string;
+  tier: "pro" | "flash";
+  agentDir?: string;
+}): Promise<void> {
+  const { store, profileId, tier, agentDir } = params;
+  const profile = store.profiles[profileId];
+  if (!profile) {
+    return;
+  }
+
+  const updated = await authProfileUsageDeps.updateAuthProfileStoreWithLock({
+    agentDir,
+    updater: (freshStore) => {
+      const profileLocal = freshStore.profiles[profileId];
+      if (!profileLocal) {
+        return false;
+      }
+      const now = Date.now();
+      const todayKey = utcDateKey(now);
+      const yesterdayKey = utcDateKey(now - 24 * 60 * 60 * 1000);
+      const existing = freshStore.usageStats?.[profileId];
+      const existingCounts = existing?.dailyRequestCounts ?? {};
+      const nextTodayCount = (existingCounts[todayKey]?.[tier] ?? 0) + 1;
+      const prunedCounts: Record<string, Record<string, number>> = {};
+      for (const key of [yesterdayKey, todayKey]) {
+        if (existingCounts[key]) {
+          prunedCounts[key] = { ...existingCounts[key] };
+        }
+      }
+      prunedCounts[todayKey] = { ...prunedCounts[todayKey], [tier]: nextTodayCount };
+      updateUsageStatsEntry(freshStore, profileId, (currentExisting) => ({
+        ...currentExisting,
+        dailyRequestCounts: prunedCounts,
+      }));
+      return true;
+    },
+  });
+  if (updated) {
+    store.usageStats = updated.usageStats;
+    return;
+  }
+  if (updated === null) {
+    logDroppedAuthProfileBookkeeping("gemini_daily_request_count", profileId);
+  }
+}
+
 export { testing as __testing };

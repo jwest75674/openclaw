@@ -27,9 +27,13 @@ const { markAuthProfileSuccessMock, ensureAuthProfileStoreMock } = vi.hoisted(()
   ensureAuthProfileStoreMock: vi.fn(() => ({ version: 1 as const, profiles: {} })),
 }));
 
-vi.mock("./auth-profiles.js", () => ({
-  markAuthProfileSuccess: (...args: unknown[]) => markAuthProfileSuccessMock(...args),
-}));
+vi.mock("./auth-profiles.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./auth-profiles.js")>();
+  return {
+    ...actual,
+    markAuthProfileSuccess: (...args: unknown[]) => markAuthProfileSuccessMock(...args),
+  };
+});
 
 vi.mock("./model-auth.js", () => ({
   ensureAuthProfileStore: (...args: unknown[]) => ensureAuthProfileStoreMock(...args),

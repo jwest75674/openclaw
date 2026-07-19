@@ -44,6 +44,10 @@ import { normalizeMessageChannel } from "../../utils/message-channel.js";
 import { resolveAgentWorkspaceDir } from "../agent-scope-config.js";
 import { resolveAgentDir, resolveSessionAgentIds } from "../agent-scope.js";
 import { externalCliDiscoveryForProviderAuth } from "../auth-profiles/external-cli-discovery.js";
+import {
+  classifyGeminiQuotaTier,
+  isGoogleGeminiCliProvider,
+} from "../auth-profiles/gemini-quota-tiers.js";
 import { resolveApiKeyForProfile } from "../auth-profiles/oauth.js";
 import { resolveAuthProfileOrder } from "../auth-profiles/order.js";
 import { loadAuthProfileStoreForRuntime } from "../auth-profiles/store.js";
@@ -509,6 +513,16 @@ export async function prepareCliRunContext(
     agentId: params.agentId,
   });
   const agentDir = resolveAgentDir(params.config ?? {}, sessionAgentId);
+  // Resolved ahead of auth-profile selection (rather than alongside the rest
+  // of the model/context fields further below) so a Gemini quota tier can be
+  // derived and passed as `forModel` to resolveAuthProfileOrder, letting
+  // profile selection skip a profile that is cooled down or already at
+  // today's daily-quota ceiling for the specific tier being requested.
+  const preAuthModelId = (params.model ?? "default").trim() || "default";
+  const preAuthNormalizedModel = normalizeCliModel(preAuthModelId, backendResolved.config);
+  const authProfileOrderForModel = isGoogleGeminiCliProvider(params.provider)
+    ? (classifyGeminiQuotaTier(preAuthNormalizedModel) ?? preAuthNormalizedModel)
+    : preAuthNormalizedModel;
   const requestedAuthProfileId = params.authProfileId?.trim() || undefined;
   let effectiveAuthProfileId =
     requestedAuthProfileId ?? backendResolved.defaultAuthProfileId?.trim() ?? undefined;
@@ -533,6 +547,7 @@ export async function prepareCliRunContext(
         cfg: params.config,
         store: authStore,
         provider: params.provider,
+        forModel: authProfileOrderForModel,
       })[0]?.trim() || undefined;
     if (effectiveAuthProfileId) {
       authCredential = authStore.profiles[effectiveAuthProfileId];
@@ -600,12 +615,12 @@ export async function prepareCliRunContext(
       )
     : undefined;
 
-  const modelId = (params.model ?? "default").trim() || "default";
+  const modelId = preAuthModelId;
   const modelProvider =
     normalizeOptionalMcpContextValue(params.modelProvider) ??
     normalizeOptionalMcpContextValue(params.provider) ??
     params.provider;
-  const normalizedModel = normalizeCliModel(modelId, backendResolved.config);
+  const normalizedModel = preAuthNormalizedModel;
   const modelDisplay = `${params.provider}/${modelId}`;
   const isClaudeCli = isClaudeCliProvider(params.provider);
   const modelContextTokens = isClaudeCli

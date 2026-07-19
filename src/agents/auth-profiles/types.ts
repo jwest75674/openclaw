@@ -114,6 +114,22 @@ export type ProfileUsageStats = {
   errorCount?: number;
   failureCounts?: Partial<Record<AuthProfileFailureReason, number>>;
   lastFailureAt?: number;
+  /**
+   * Per-UTC-date request counts for providers with independent daily quota
+   * tiers below the whole-profile level (e.g. Gemini CLI's separate
+   * pro/flash daily caps). Keyed by UTC date ("YYYY-MM-DD"), then by tier
+   * name (e.g. "pro" | "flash"). Only the most recent date or two are kept;
+   * older dates are pruned on write.
+   */
+  dailyRequestCounts?: Record<string, Record<string, number>>;
+  /**
+   * Tier-scoped cooldown-until timestamps (ms epoch), independent of the
+   * profile-wide/model-scoped cooldown fields above. Used for daily-quota
+   * exhaustion signals that must not affect other tiers on the same
+   * profile (e.g. a Gemini pro-tier 429 must not block flash-tier use).
+   * Keyed by tier name (e.g. "pro" | "flash").
+   */
+  tierCooldowns?: Record<string, number>;
 };
 
 /** Durable, non-secret auth profile selection state. */

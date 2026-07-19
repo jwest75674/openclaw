@@ -93,7 +93,17 @@ export {
   markAuthProfileCooldown,
   markAuthProfileBlockedUntil,
   markAuthProfileFailure,
+  markAuthProfileGeminiQuotaExhausted,
+  recordAuthProfileGeminiDailyRequest,
   resolveProfilesUnavailableReason,
   resolveProfileUnusableUntilForDisplay,
   setAuthProfileFailureHook,
 } from "./auth-profiles/usage.js";
+export {
+  classifyGeminiQuotaTier,
+  GEMINI_QUOTA_TIER_DAILY_LIMITS,
+  isGeminiQuotaTier,
+  isGoogleGeminiCliProvider,
+  resolveNextUtcMidnightMs,
+  type GeminiQuotaTier,
+} from "./auth-profiles/gemini-quota-tiers.js";

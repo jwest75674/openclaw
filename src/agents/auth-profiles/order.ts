@@ -16,12 +16,14 @@ import {
   evaluateStoredCredentialEligibility,
   type AuthCredentialReasonCode,
 } from "./credential-state.js";
+import { isGeminiQuotaTier, resolveNextUtcMidnightMs } from "./gemini-quota-tiers.js";
 import { dedupeProfileIds, listProfilesForProvider } from "./profile-list.js";
 import type { AuthProfileCredential, AuthProfileStore } from "./types.js";
 import {
   clearExpiredCooldowns,
   isProfileInCooldown,
   resolveProfileUnusableUntil,
+  resolveTierCooldownUntil,
 } from "./usage-state.js";
 
 /** Reason a profile is or is not eligible for provider auth. */
@@ -246,8 +248,15 @@ export function resolveAuthProfileOrder(params: {
   store: AuthProfileStore;
   provider: string;
   preferredProfile?: string;
+  /**
+   * Optional model-scoping key used to bypass model-scoped cooldowns
+   * (rate_limit/timeout) and, for google-gemini-cli, a Gemini quota tier
+   * ("pro" | "flash") used to skip profiles that are cooled down or already
+   * at today's daily-quota ceiling for that tier specifically.
+   */
+  forModel?: string;
 }): string[] {
-  const { cfg, store, provider, preferredProfile } = params;
+  const { cfg, store, provider, preferredProfile, forModel } = params;
   const providerKey = normalizeProviderId(provider);
   const providerAuthKey = resolveProviderIdForAuth(provider, { config: cfg });
   const now = Date.now();
@@ -354,7 +363,7 @@ export function resolveAuthProfileOrder(params: {
     const inCooldown: Array<{ profileId: string; cooldownUntil: number }> = [];
 
     for (const profileId of deduped) {
-      if (isProfileInCooldown(store, profileId)) {
+      if (isProfileInCooldown(store, profileId, now, forModel)) {
         const cooldownUntil =
           resolveProfileUnusableUntil(store.usageStats?.[profileId] ?? {}) ?? now;
         inCooldown.push({ profileId, cooldownUntil });
@@ -378,7 +387,7 @@ export function resolveAuthProfileOrder(params: {
 
   // Otherwise, use round-robin by lastUsed. lastGood is intentionally ignored
   // because prioritizing it would starve other healthy profiles.
-  const sorted = orderProfilesByMode(deduped, store);
+  const sorted = orderProfilesByMode(deduped, store, forModel);
 
   if (preferredProfile && sorted.includes(preferredProfile)) {
     return [preferredProfile, ...sorted.filter((e) => e !== preferredProfile)];
@@ -421,7 +430,11 @@ function mergeAliasOrderWithNativeProfiles(params: {
   );
 }
 
-function orderProfilesByMode(order: string[], store: AuthProfileStore): string[] {
+function orderProfilesByMode(
+  order: string[],
+  store: AuthProfileStore,
+  forModel?: string,
+): string[] {
   const now = Date.now();
 
   // Partition into available and in-cooldown
@@ -429,7 +442,7 @@ function orderProfilesByMode(order: string[], store: AuthProfileStore): string[]
   const inCooldown: string[] = [];
 
   for (const profileId of order) {
-    if (isProfileInCooldown(store, profileId)) {
+    if (isProfileInCooldown(store, profileId, now, forModel)) {
       inCooldown.push(profileId);
     } else {
       available.push(profileId);
@@ -459,10 +472,25 @@ function orderProfilesByMode(order: string[], store: AuthProfileStore): string[]
 
   // Append cooldown profiles at the end (sorted by cooldown expiry, soonest first)
   const cooldownSorted = inCooldown
-    .map((profileId) => ({
-      profileId,
-      cooldownUntil: resolveProfileUnusableUntil(store.usageStats?.[profileId] ?? {}) ?? now,
-    }))
+    .map((profileId) => {
+      const stats = store.usageStats?.[profileId] ?? {};
+      const genericUntil = resolveProfileUnusableUntil(stats);
+      const tierUntil = resolveTierCooldownUntil(stats, forModel, now);
+      const candidates = [genericUntil, tierUntil].filter(
+        (value): value is number => typeof value === "number",
+      );
+      if (candidates.length === 0 && isGeminiQuotaTier(forModel)) {
+        // No recorded cooldown timestamp at all -- this profile is only
+        // "in cooldown" because it is over today's daily-quota count for
+        // this tier. Estimate recovery as the next UTC midnight, when
+        // Google resets the daily counter.
+        candidates.push(resolveNextUtcMidnightMs(now));
+      }
+      return {
+        profileId,
+        cooldownUntil: candidates.length > 0 ? Math.max(...candidates) : now,
+      };
+    })
     .toSorted((a, b) => a.cooldownUntil - b.cooldownUntil)
     .map((entry) => entry.profileId);
 

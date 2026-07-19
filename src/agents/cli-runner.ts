@@ -19,7 +19,15 @@ import {
 import { resolveBlockMessage } from "../plugins/hook-decision-types.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import { resolveAgentDir, resolveSessionAgentIds } from "./agent-scope.js";
-import { markAuthProfileSuccess } from "./auth-profiles.js";
+import {
+  classifyGeminiQuotaTier,
+  isGoogleGeminiCliProvider,
+  markAuthProfileGeminiQuotaExhausted,
+  markAuthProfileSuccess,
+  recordAuthProfileGeminiDailyRequest,
+  resolveNextUtcMidnightMs,
+} from "./auth-profiles.js";
+import { isGeminiDailyQuotaExhaustedErrorText } from "./auth-profiles/gemini-quota-tiers.js";
 import { isHeartbeatLifecycleRunKind } from "./bootstrap-mode.js";
 import { resolveCliBackendConfig } from "./cli-backends.js";
 import type { CliOutput } from "./cli-output.js";
@@ -435,6 +443,57 @@ export function runCliAgent(paramsInput: RunCliAgentParams): Promise<EmbeddedAge
   );
 }
 
+/**
+ * Classifies a failed gemini-cli run for daily-quota exhaustion and, when
+ * matched, records a tier-scoped cooldown so profile selection stops
+ * retrying this profile for the exhausted tier until Google's UTC-midnight
+ * reset -- instead of immediately retrying the same profile next turn (the
+ * CLI-backend path previously fed no failure signal back into auth-profile
+ * bookkeeping at all; see recordCliAuthProfileSuccess above for the
+ * companion success-side gap).
+ *
+ * Deliberately narrow in scope: this only handles Gemini's daily-quota
+ * signature (RESOURCE_EXHAUSTED/429 + "quota" + "day"/"daily" in the raw CLI
+ * error text). Other CLI-backend failure reasons/providers are unaffected.
+ */
+function recordCliAuthProfileGeminiQuotaFailure(
+  error: unknown,
+  context: PreparedCliRunContext,
+): void {
+  const profileId = context.effectiveAuthProfileId;
+  if (!profileId || !isGoogleGeminiCliProvider(context.backendResolved.id)) {
+    return;
+  }
+  if (!isFailoverError(error) || error.reason !== "rate_limit") {
+    return;
+  }
+  if (!isGeminiDailyQuotaExhaustedErrorText(error.message)) {
+    return;
+  }
+  const tier = classifyGeminiQuotaTier(context.normalizedModel);
+  if (!tier) {
+    return;
+  }
+  const { sessionAgentId } = resolveSessionAgentIds({
+    sessionKey: context.params.sessionKey,
+    config: context.params.config,
+    agentId: context.params.agentId,
+  });
+  const agentDir = resolveAgentDir(context.params.config ?? {}, sessionAgentId);
+  void markAuthProfileGeminiQuotaExhausted({
+    store: ensureAuthProfileStore(agentDir, { allowKeychainPrompt: false }),
+    profileId,
+    tier,
+    cooldownUntil: resolveNextUtcMidnightMs(Date.now()),
+    agentDir,
+    runId: context.params.runId,
+  }).catch((err: unknown) => {
+    log.warn(
+      `cli auth-profile gemini quota-exhaustion bookkeeping failed: ${formatErrorMessage(err)}`,
+    );
+  });
+}
+
 async function runCliAgentInternal(params: RunCliAgentParams): Promise<EmbeddedAgentRunResult> {
   assertAgentRunLifecycleGenerationCurrent(params.lifecycleGeneration!);
   // Cron gate must fire before prepareCliRunContext — that call allocates
@@ -508,6 +567,7 @@ async function runCliAgentInternal(params: RunCliAgentParams): Promise<EmbeddedA
     result = await runPreparedCliAgent(context);
   } catch (error) {
     runError = error;
+    recordCliAuthProfileGeminiQuotaFailure(error, context);
   }
   let cleanupError: unknown;
   const recordCleanupError = (error: unknown) => {
@@ -569,16 +629,37 @@ export async function runPreparedCliAgent(
     if (!profileId) {
       return;
     }
+    const authProfileStore = ensureAuthProfileStore(agentDir, { allowKeychainPrompt: false });
     void markAuthProfileSuccess({
-      store: ensureAuthProfileStore(agentDir, { allowKeychainPrompt: false }),
+      store: authProfileStore,
       provider: context.backendResolved.id,
       profileId,
       agentDir,
-    }).catch((err) => {
+    }).catch((err: unknown) => {
       log.warn(
         `cli auth-profile success bookkeeping failed: provider=${context.backendResolved.id} ${formatErrorMessage(err)}`,
       );
     });
+    // Gemini enforces separate daily request quotas per tier (pro vs flash)
+    // rather than one profile-wide cap. Count successful requests per tier
+    // so profile selection can proactively skip a profile that our own
+    // counting knows is at today's cap for the specific tier being
+    // requested, without waiting for a live 429 from Google.
+    if (isGoogleGeminiCliProvider(context.backendResolved.id)) {
+      const tier = classifyGeminiQuotaTier(context.normalizedModel);
+      if (tier) {
+        void recordAuthProfileGeminiDailyRequest({
+          store: authProfileStore,
+          profileId,
+          tier,
+          agentDir,
+        }).catch((err: unknown) => {
+          log.warn(
+            `cli auth-profile gemini daily request count bookkeeping failed: ${formatErrorMessage(err)}`,
+          );
+        });
+      }
+    }
   };
   const sessionBindingDisabled = context.preparedBackend.backend.sessionMode === "none";
   const hookRunner = getGlobalHookRunner();
