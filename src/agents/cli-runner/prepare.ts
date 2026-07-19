@@ -863,12 +863,12 @@ export async function prepareCliRunContext(
       env: preparedBackend.env,
     } as Parameters<NonNullable<typeof backendResolved.prepareExecution>>[0];
     preparedExecution = await backendResolved.prepareExecution?.(
-      (backendResolved.id === "google-gemini-cli"
+      (backendResolved.id === "google-gemini-cli" || isClaudeCliProvider(backendResolved.id)
         ? {
             ...prepareExecutionContext,
-            // Private bridge for bundled Gemini CLI. This is intentionally not
-            // part of the public Plugin SDK until a credential-forwarding
-            // contract exists.
+            // Private bridge for bundled Gemini CLI and Claude CLI auth-profile
+            // rotation. This is intentionally not part of the public Plugin SDK
+            // until a credential-forwarding contract exists.
             authCredential,
           }
         : prepareExecutionContext) as typeof prepareExecutionContext & {

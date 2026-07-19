@@ -854,6 +854,81 @@ describe("shouldSkipLocalCliCredentialEpoch", () => {
     }
   });
 
+  it("exposes registered claude-cli auth profile credentials so seat rotation can redirect CLAUDE_CONFIG_DIR", async () => {
+    // Mirrors Gemini's private authCredential bridge (see the "does not expose"
+    // test above) but for the claude-cli backend id specifically: registered
+    // claude-cli auth profiles need their credential forwarded to
+    // prepareExecution so extensions/anthropic/cli-backend-auth.runtime.ts can
+    // read metadata.homeDir and rotate across logged-in Claude Code CLI seats.
+    const { dir, sessionFile } = createSessionFile();
+    const agentDir = path.join(dir, "agents", "main", "agent");
+    const authProfileId = "claude-cli:seat2";
+    const prepareExecution = vi.fn(async (_ctx: unknown) => undefined);
+    fs.mkdirSync(agentDir, { recursive: true });
+    saveAuthProfileStore(
+      {
+        version: 1,
+        profiles: {
+          [authProfileId]: {
+            type: "token",
+            provider: "claude-cli",
+            token: "external-cli-home",
+            metadata: { homeDir: "/home/user/.claude-seats/seat2" },
+          },
+        },
+      },
+      agentDir,
+    );
+    cliBackendsTesting.setDepsForTest({
+      resolvePluginSetupCliBackend: () => undefined,
+      resolveRuntimeCliBackends: () => [
+        {
+          id: "claude-cli",
+          pluginId: "anthropic",
+          bundleMcp: false,
+          authEpochMode: "profile-only",
+          prepareExecution,
+          config: {
+            command: "claude",
+            args: ["-p", "--prompt", "{prompt}"],
+            output: "jsonl",
+            input: "stdin",
+            sessionMode: "existing",
+          },
+        },
+      ],
+    });
+
+    try {
+      await prepareCliRunContext({
+        sessionId: "session-test",
+        sessionKey: "agent:main:main",
+        sessionFile,
+        workspaceDir: dir,
+        prompt: "latest ask",
+        provider: "claude-cli",
+        model: "claude-sonnet-5",
+        timeoutMs: 1_000,
+        runId: "run-test-claude-cli-seat-rotation",
+        authProfileId,
+        config: {},
+      });
+
+      expect(prepareExecution).toHaveBeenCalledWith(
+        expect.objectContaining({
+          authProfileId,
+          authCredential: expect.objectContaining({
+            type: "token",
+            provider: "claude-cli",
+            metadata: { homeDir: "/home/user/.claude-seats/seat2" },
+          }),
+        }),
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("lets Gemini CLI preparation override generated MCP system settings auth", async () => {
     const { dir, sessionFile } = createSessionFile();
     const profileSystemSettingsPath = path.join(dir, "profile-system-settings.json");
