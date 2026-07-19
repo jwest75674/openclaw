@@ -158,6 +158,7 @@ function normalizeRawCredentialEntry(raw: Record<string, unknown>): Partial<Auth
     const token = normalizeOptionalCredentialString(entry.token);
     const tokenRef = coerceSecretRef(entry.tokenRef);
     const expires = normalizeExpiryField(entry.expires);
+    const metadata = normalizeCredentialMetadata(entry.metadata);
     if (token !== undefined) {
       normalized.token = token;
     }
@@ -166,6 +167,9 @@ function normalizeRawCredentialEntry(raw: Record<string, unknown>): Partial<Auth
     }
     if (expires !== undefined) {
       normalized.expires = expires;
+    }
+    if (metadata) {
+      normalized.metadata = metadata;
     }
     return normalized as Partial<AuthProfileCredential>;
   }

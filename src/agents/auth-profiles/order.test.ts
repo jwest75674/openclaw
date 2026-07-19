@@ -594,4 +594,42 @@ describe("resolveAuthProfileOrder", () => {
       }),
     ).toBe(false);
   });
+
+  it("round-robins registered claude-cli seat profiles by lastUsed (mirrors google-gemini-cli rotation)", () => {
+    // Each profile's credential only carries a metadata.homeDir pointer (see
+    // extensions/anthropic/cli-backend-auth.runtime.ts) rather than raw OAuth
+    // material, since OpenClaw does not own Anthropic subscription refresh.
+    const store: AuthProfileStore = {
+      version: 1,
+      profiles: {
+        "claude-cli:main": {
+          type: "token",
+          provider: "claude-cli",
+          token: "external-cli-home",
+          metadata: { homeDir: "/home/user/.claude" },
+        },
+        "claude-cli:seat2": {
+          type: "token",
+          provider: "claude-cli",
+          token: "external-cli-home",
+          metadata: { homeDir: "/home/user/.claude-seats/seat2" },
+        },
+        "claude-cli:seat3": {
+          type: "token",
+          provider: "claude-cli",
+          token: "external-cli-home",
+          metadata: { homeDir: "/home/user/.claude-seats/seat3" },
+        },
+      },
+      usageStats: {
+        "claude-cli:main": { lastUsed: 300 },
+        "claude-cli:seat2": { lastUsed: 100 },
+        "claude-cli:seat3": { lastUsed: 200 },
+      },
+    };
+
+    const order = resolveAuthProfileOrder({ store, provider: "claude-cli" });
+
+    expect(order).toEqual(["claude-cli:seat2", "claude-cli:seat3", "claude-cli:main"]);
+  });
 });

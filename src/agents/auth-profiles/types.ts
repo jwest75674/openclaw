@@ -58,6 +58,12 @@ export type TokenCredential = {
   expires?: number;
   email?: string;
   displayName?: string;
+  /**
+   * Optional provider-specific metadata (e.g. an external CLI home directory
+   * pointer for backends that authenticate via an on-disk CLI login state
+   * rather than a bearer token OpenClaw refreshes).
+   */
+  metadata?: Record<string, string>;
 };
 
 /** Refreshable OAuth credential plus provider metadata and legacy references. */

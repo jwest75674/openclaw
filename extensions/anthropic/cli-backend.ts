@@ -44,6 +44,19 @@ export function buildAnthropicCliBackend(): CliBackendPlugin {
     nativeToolMode: "selectable",
     sideQuestionToolMode: "disabled",
     ownsNativeCompaction: true,
+    // Lets resolveAuthProfileOrder() round-robin registered claude-cli auth
+    // profiles across multiple logged-in Claude Code CLI seats, the same way
+    // this already works for google-gemini-cli. See cli-backend-auth.runtime.ts
+    // for why this never materializes credential material the way Gemini's
+    // hook does.
+    authEpochMode: "profile-only",
+    prepareExecution: async (ctx) => {
+      const { prepareClaudeCliAuthHome } = await import("./cli-backend-auth.runtime.js");
+      return await prepareClaudeCliAuthHome(
+        { authProfileId: ctx.authProfileId },
+        (ctx as typeof ctx & { authCredential?: unknown }).authCredential,
+      );
+    },
     config: {
       command: "claude",
       args: [

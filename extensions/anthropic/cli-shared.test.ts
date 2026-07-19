@@ -550,4 +550,22 @@ describe("normalizeClaudeBackendConfig", () => {
     expectDefaultDisallowedTools(backend.config.args);
     expectDefaultDisallowedTools(backend.config.resumeArgs);
   });
+
+  it("wires profile-only auth epoch and a prepareExecution hook so registered claude-cli auth profiles rotate across seats", () => {
+    const backend = buildAnthropicCliBackend();
+
+    expect(backend.authEpochMode).toBe("profile-only");
+    expect(backend.prepareExecution).toBeTypeOf("function");
+  });
+
+  it("prepareExecution is a no-op when no auth profile is selected (legacy static single-seat config)", async () => {
+    const backend = buildAnthropicCliBackend();
+    const prepared = await backend.prepareExecution?.({
+      workspaceDir: "/workspace",
+      provider: "claude-cli",
+      modelId: "claude-sonnet-5",
+      authProfileId: undefined,
+    });
+    expect(prepared ?? null).toBeNull();
+  });
 });
