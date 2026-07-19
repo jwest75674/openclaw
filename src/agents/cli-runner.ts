@@ -18,6 +18,8 @@ import {
 } from "../plugins/hook-agent-context.js";
 import { resolveBlockMessage } from "../plugins/hook-decision-types.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
+import { resolveAgentDir, resolveSessionAgentIds } from "./agent-scope.js";
+import { markAuthProfileSuccess } from "./auth-profiles.js";
 import { isHeartbeatLifecycleRunKind } from "./bootstrap-mode.js";
 import { resolveCliBackendConfig } from "./cli-backends.js";
 import type { CliOutput } from "./cli-output.js";
@@ -59,6 +61,7 @@ import {
   runAgentHarnessLlmInputHook,
   runAgentHarnessLlmOutputHook,
 } from "./harness/lifecycle-hook-helpers.js";
+import { ensureAuthProfileStore } from "./model-auth.js";
 import type { AgentMessage } from "./runtime/index.js";
 import { SessionManager } from "./sessions/session-manager.js";
 import { buildAssistantMessage, buildUsageWithNoCost } from "./stream-message-shared.js";
@@ -547,6 +550,36 @@ export async function runPreparedCliAgent(
 ): Promise<EmbeddedAgentRunResult> {
   const { executePreparedCliRun } = await import("./cli-runner/execute.runtime.js");
   const { params } = context;
+  const { sessionAgentId } = resolveSessionAgentIds({
+    sessionKey: params.sessionKey,
+    config: params.config,
+    agentId: params.agentId,
+  });
+  const agentDir = resolveAgentDir(params.config ?? {}, sessionAgentId);
+  // CLI-backend runs (gemini-cli, claude-cli-seatN, codex, ...) never fed
+  // auth-profile bookkeeping back into the round-robin state -- only the
+  // native embedded-agent-runner path (embedded-agent-runner/run.ts) did.
+  // With lastUsed permanently unset for these profiles, the "round robin by
+  // lastUsed" sort in auth-profiles/order.ts is a no-op tie that always
+  // resolves to the same (first-in-store-order) profile. Recording success
+  // here closes that gap so multi-profile rotation (e.g. 5 google-gemini-cli
+  // OAuth accounts) actually advances.
+  const recordCliAuthProfileSuccess = (): void => {
+    const profileId = context.effectiveAuthProfileId;
+    if (!profileId) {
+      return;
+    }
+    void markAuthProfileSuccess({
+      store: ensureAuthProfileStore(agentDir, { allowKeychainPrompt: false }),
+      provider: context.backendResolved.id,
+      profileId,
+      agentDir,
+    }).catch((err) => {
+      log.warn(
+        `cli auth-profile success bookkeeping failed: provider=${context.backendResolved.id} ${formatErrorMessage(err)}`,
+      );
+    });
+  };
   const sessionBindingDisabled = context.preparedBackend.backend.sessionMode === "none";
   const hookRunner = getGlobalHookRunner();
   const hasLlmInputHooks = hookRunner?.hasHooks("llm_input") === true;
@@ -1148,6 +1181,7 @@ export async function runPreparedCliAgent(
           ctx: hookContext,
           hookRunner,
         });
+        recordCliAuthProfileSuccess();
         return buildCliRunResult({
           output,
           effectiveCliSessionId,
